@@ -399,6 +399,12 @@ body.authed.view-home .home{display:flex;}
         <p>Crie, atualize e gere propostas em PDF.</p>
         <span class="mc-action">Acessar propostas <span class="svg-ic" data-ic="arrow"></span></span>
       </button>
+      <button class="module-card" id="openTab">
+        <span class="mc-ic"><span class="svg-ic" data-ic="layers"></span></span>
+        <h3>Tabelas</h3>
+        <p>Consulte e atualize as tabelas ILIKIA (rodoviario e aereo).</p>
+        <span class="mc-action">Acessar tabelas <span class="svg-ic" data-ic="arrow"></span></span>
+      </button>
     </div>
   </div>
 </div>
@@ -453,6 +459,7 @@ body.authed.view-home .home{display:flex;}
 
 <input type="file" id="fileImport" accept="application/json,.json,.efaprop" style="display:none">
 <input type="file" id="fileImg" accept="image/*" style="display:none">
+<div id="tabelasView"></div>
 <div id="modalHost"></div>
 <div class="toast" id="toast"></div>
 
@@ -460,7 +467,9 @@ body.authed.view-home .home{display:flex;}
 </script>
 <script src="firebase-config.js"></script>
 <script src="cloud-store.js"></script>
+<script src="tabelas-store.js"></script>
 <script src="firebase-service.js"></script>
+<script src="tabelas-module.js"></script>
 <script>
 "use strict";
 const A=(window.EFA_ASSETS||{});
@@ -1102,6 +1111,7 @@ document.addEventListener('change',e=>{
 document.addEventListener('click',e=>{
   const b=e.target.closest('button, .prop-card'); if(!b)return; const o=cur();
   if(b.id==='openProp'){ openPropModule(); return; }
+  if(b.id==='openTab'){ document.getElementById('tabelasView').style.display='block'; window.EfaTabelas.open(); return; }
   if(b.id==='crumbHome'){ goHome(); return; }
   const act=b.dataset.act; if(act){toolbarAction(act);return;}
   if(b.dataset.tmove!==undefined){const i=+b.dataset.tmove,d=+b.dataset.dir,j=i+d;if(j>=0&&j<o.tarifas.length){const x=o.tarifas.splice(i,1)[0];o.tarifas.splice(j,0,x);markChanged(true);}return;}
