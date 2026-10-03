@@ -1,0 +1,8 @@
+{
+  "comment": "Conjunto MINIMO exigido pelas consultas do codigo (site/tabelas-store.js). Dois indices compostos. O primeiro (dataset ASC, busca ASC) JA esta ativo no projeto. O segundo (tokens array-contains, busca ASC) e o unico que falta criar. Consultas por uf/regiao/classificacao e a ordenacao do Aereo Expresso (ordem) sao resolvidas no cliente; o historico consulta so por igualdade e ordena no cliente. Por isso nao ha mais indices de (dataset,ordem), (dataset,uf,busca), (dataset,regiao,busca), (dataset,classificacao,busca), (dataset,tokens,busca) nem (ilikia_historico registro_id,criado_em).",
+  "indexes": [
+    {"collectionGroup":"ilikia_registros","queryScope":"COLLECTION","fields":[{"fieldPath":"dataset","order":"ASCENDING"},{"fieldPath":"busca","order":"ASCENDING"}]},
+    {"collectionGroup":"ilikia_registros","queryScope":"COLLECTION","fields":[{"fieldPath":"tokens","arrayConfig":"CONTAINS"},{"fieldPath":"busca","order":"ASCENDING"}]}
+  ],
+  "fieldOverrides": []
+}

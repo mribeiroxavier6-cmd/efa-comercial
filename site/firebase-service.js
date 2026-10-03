@@ -18,11 +18,24 @@
     const repository=window.EfaCloudStore.create(dbApi,db);
     const tabelas=window.EfaTabelasStore.create(dbApi,db);
     const account=window.EFA_ACCOUNT;
+    // Importador administrativo (grava pelo navegador; a restricao efetiva e das regras do Firestore).
+    const importer=window.EfaTabelasImport
+      ? window.EfaTabelasImport.create(dbApi,db,{projectId:(window.EFA_FIREBASE_CONFIG&&window.EFA_FIREBASE_CONFIG.projectId)||null})
+      : null;
     // Tabelas usa a MESMA autenticacao. A autorizacao efetiva (quais contas) e das regras do Firestore.
     function requireAuth(){ if(!auth.currentUser)throw Object.assign(new Error('Entre novamente para continuar.'),{code:'auth/unauthorized'}); }
+    // Admin = conta autorizada a importar. A regra do Firestore e quem garante; aqui so decide o que a UI oferece.
+    const isAdmin=()=>!!(auth.currentUser && auth.currentUser.uid===account.uid);
+    function requireAdmin(){ if(!isAdmin())throw Object.assign(new Error('Acao restrita ao administrador.'),{code:'auth/forbidden'}); }
+    const importerApi = importer ? {
+      validate:json=>importer.validate(json),
+      run:(json,onProgress)=>{ requireAdmin(); return importer.run(json,onProgress); },
+      getProgress:()=>{ requireAdmin(); return importer.getProgress(); }
+    } : null;
     const tabelasApi={
       queryPage:p=>{requireAuth();return tabelas.queryPage(p);},
       getRecord:id=>{requireAuth();return tabelas.getRecord(id);},
+      getMeta:()=>{requireAuth();return tabelas.getMeta();},
       historico:id=>{requireAuth();return tabelas.historico(id);},
       saveCampos:i=>{requireAuth();return tabelas.saveCampos(Object.assign({usuario:(auth.currentUser&&auth.currentUser.email)||null},i));},
       subscribeRecord:(id,cb)=>{requireAuth();return tabelas.subscribeRecord(id,cb);},
@@ -42,6 +55,8 @@
       save:state=>{requireAccount();return repository.save(state);},
       snapshot:()=>repository.snapshot(),
       tabelas:tabelasApi,
+      isAdmin,
+      importer:importerApi,
       currentUserEmail:()=>auth.currentUser?auth.currentUser.email:null
     };
   }

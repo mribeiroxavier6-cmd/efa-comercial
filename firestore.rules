@@ -1,9 +1,74 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /{document=**} {
-      allow read, write: if request.auth != null
+
+    // ---- Conta das Propostas (inalterada). Identificador publico; a seguranca e esta regra. ----
+    function propostasAuth() {
+      return request.auth != null
         && request.auth.uid == 'E0ozFiP2X1OqejVR5e7S2yvqRvG3';
+    }
+
+    // ---- Administrador do modulo Tabelas: unica conta autorizada a IMPORTAR a base,
+    //      a gravar o agregado do mapa (ilikia_meta) e o progresso da importacao (ilikia_import). ----
+    function isAdmin() {
+      return request.auth != null
+        && request.auth.uid == 'E0ozFiP2X1OqejVR5e7S2yvqRvG3';
+    }
+
+    // ---- Equipe autorizada a CONSULTAR e EDITAR as Tabelas. Adicione o UID de cada membro
+    //      aqui (apos cria-lo em Authentication). O admin acima ja esta incluido.
+    //      Importante: estar nesta lista permite EDITAR, nao IMPORTAR (import e so do admin acima). ----
+    function tabelasAutorizados() {
+      return [
+        'E0ozFiP2X1OqejVR5e7S2yvqRvG3'
+        // TEAM_UID_SLOT (para cada membro da equipe, adicione uma linha: , 'UID_DO_MEMBRO')
+      ];
+    }
+    function tabelasAuth() {
+      return request.auth != null && request.auth.uid in tabelasAutorizados();
+    }
+
+    // ---- Propostas comerciais: escopo proprio, somente a conta das Propostas ----
+    match /comercial/{document=**} {
+      allow read, write: if propostasAuth();
+    }
+
+    // ---- Tabelas ILIKIA: colecoes proprias ----
+    match /ilikia_registros/{id} {
+      allow read: if tabelasAuth();
+      // CRIACAO (importacao da base): restrita ao admin. Exige forma minima valida.
+      allow create: if isAdmin()
+        && request.resource.data.id == id
+        && request.resource.data.versao is int
+        && request.resource.data.campos is list;
+      // ATUALIZACAO (edicao pela equipe): versao sobe exatamente 1 (trava otimista no servidor).
+      // So altera documento existente; nunca recria. Com isso, um set() da importacao sobre um
+      // documento que JA existe cai aqui, exige versao+1 e e RECUSADO: o conteudo online e preservado
+      // pelo servidor (nao so pela interface). A importacao, portanto, nunca sobrescreve.
+      allow update: if tabelasAuth()
+        && request.resource.data.id == id
+        && request.resource.data.campos is list
+        && request.resource.data.versao == resource.data.versao + 1;
+      allow delete: if false;
+    }
+
+    match /ilikia_historico/{id} {
+      allow read: if tabelasAuth();
+      allow create: if tabelasAuth()
+        && request.resource.data.registro_id is string
+        && request.resource.data.versao is int;
+      allow update, delete: if false; // append-only
+    }
+
+    // Agregados (contagem do mapa por UF). Leitura autorizada; escrita so pelo admin (importador no navegador).
+    match /ilikia_meta/{id} {
+      allow read: if tabelasAuth();
+      allow write: if isAdmin();
+    }
+
+    // Progresso da importacao (retomada sem duplicar). So o admin le e grava.
+    match /ilikia_import/{id} {
+      allow read, write: if isAdmin();
     }
   }
 }

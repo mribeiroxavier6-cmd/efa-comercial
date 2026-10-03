@@ -41,54 +41,82 @@
     const colReg=()=>api.collection(db,REG);
     const docReg=id=>api.doc(db,REG,id);
 
-    // ---- monta a query conforme filtros (eq + orderBy) ----
+    /* ---- monta a query conforme os filtros, com indice MINIMO e deterministico ----
+       Uma unica estrategia de servidor por caso; o resto filtra no cliente (matchRow):
+         - 'busca'  : ha texto de busca -> where(tokens array-contains token0) + orderBy(busca).
+                      Indice composto (tokens[array], busca). dataset/uf/regiao/classificacao refinam no cliente.
+         - 'dataset': modalidade escolhida e sem busca -> where(dataset==) + orderBy(busca).
+                      Indice composto (dataset, busca), que JA esta ativo no projeto. uf/regiao/classificacao no cliente.
+         - 'scan'   : sem modalidade e sem busca (pode ter filtro geografico) -> orderBy(busca) apenas.
+                      Indice de campo unico (automatico). uf/regiao/classificacao no cliente.
+       AEREO_EXPRESSO cai em 'dataset' (orderBy busca); a ordenacao por 'ordem' e feita no cliente (modulo),
+       para nao exigir o indice (dataset, ordem). */
     function buildConstraints(p){
       const cs=[];
-      if(p.dataset) cs.push(api.where('dataset','==',p.dataset));
-      if(p.uf) cs.push(api.where('uf','==',p.uf));
-      if(p.regiao) cs.push(api.where('regiao','==',p.regiao));
-      if(p.classificacao) cs.push(api.where('classificacao','==',p.classificacao));
-      // busca por palavra inteira (array-contains do primeiro token); refino de substring no cliente
       const tokens=normTokens(p.busca);
-      if(tokens.length) cs.push(api.where('tokens','array-contains',tokens[0]));
-      const ordBy = p.dataset==='AEREO_EXPRESSO' ? 'ordem' : 'busca';
-      cs.push(api.orderBy(ordBy));
-      return {cs, tokens, ordBy};
+      let strategy;
+      if(tokens.length){ cs.push(api.where('tokens','array-contains',tokens[0])); strategy='busca'; }
+      else if(p.dataset){ cs.push(api.where('dataset','==',p.dataset)); strategy='dataset'; }
+      else { strategy='scan'; }
+      cs.push(api.orderBy('busca'));
+      return {cs, tokens, strategy};
     }
     function normTokens(s){
       if(!s) return [];
       const n=String(s).normalize('NFKD').replace(/[̀-ͯ]/g,'').replace(/\s+/g,' ').trim().toLowerCase();
       return n? n.split(' ').filter(Boolean) : [];
     }
-    function matchAllTokens(row,tokens){
-      if(!tokens.length) return true;
-      const hay=(row.busca||'')+' '+((row.tokens||[]).join(' '));
-      return tokens.every(t=>hay.indexOf(t)>=0);
+    // Refino no cliente: aplica os filtros que NAO foram para a query + a busca por substring (palavra inteira).
+    function matchRow(row,p,tokens){
+      if(p.dataset && row.dataset!==p.dataset) return false;
+      if(p.uf && row.uf!==p.uf) return false;
+      if(p.regiao && row.regiao!==p.regiao) return false;
+      if(p.classificacao && row.classificacao!==p.classificacao) return false;
+      if(tokens&&tokens.length){
+        const hay=(row.busca||'')+' '+((row.tokens||[]).join(' '));
+        if(!tokens.every(t=>hay.indexOf(t)>=0)) return false;
+      }
+      return true;
     }
 
-    // ---- paginacao real: busca paginas ate reunir pageSize apos o refino ----
+    // ---- paginacao real: busca paginas ate reunir pageSize apos o refino no cliente ----
+    // O cursor acompanha o ULTIMO documento EXAMINADO (nao o ultimo do lote). Quando o filtro no
+    // cliente enche a pagina no meio de um lote, paramos ali e a proxima pagina retoma a partir desse
+    // documento, sem pular o restante do lote. Sem isso, documentos nao examinados do lote se perdiam.
     async function queryPage(p){
       const pageSize=p.pageSize||50;
-      const {cs,tokens,ordBy}=buildConstraints(p);
-      const out=[]; let cursor=p.cursor||null; let done=false; let scanned=0; const HARD=60;
+      const {cs,tokens,strategy}=buildConstraints(p);
+      const out=[]; let cursor=p.cursor||null; let done=false; let pageFull=false; let scanned=0; const HARD=80;
       while(out.length<pageSize && !done && scanned<HARD){
-        const extra=[api.limit(pageSize)];
-        if(cursor) extra.unshift(api.startAfter(cursor));
+        const extra=[];
+        if(cursor) extra.push(api.startAfter(cursor));
+        extra.push(api.limit(pageSize));
         const snap=await api.getDocs(api.query(colReg(),...cs,...extra));
-        if(snap.empty || snap.docs.length===0){ done=true; break; }
-        cursor=snap.docs[snap.docs.length-1];
-        if(snap.docs.length<pageSize) done=true;
-        for(const d of snap.docs){ const row=d.data(); if(matchAllTokens(row,tokens)) out.push(row); if(out.length>=pageSize) break; }
+        const docs=snap.docs||[];
+        if(docs.length===0){ done=true; break; }
+        pageFull=false;
+        for(const d of docs){
+          cursor=d;                                        // avanca o cursor a cada doc examinado
+          if(matchRow(d.data(),p,tokens)) out.push(d.data());
+          if(out.length>=pageSize){ pageFull=true; break; } // pagina cheia: pode ser no meio do lote
+        }
         scanned++;
+        if(pageFull) break;                                // retoma depois do ultimo doc examinado
+        if(docs.length<pageSize) done=true;                // lote parcial consumido inteiro: servidor esgotou
       }
-      return {rows:out, cursor:done?null:cursor, done, ordBy};
+      return {rows:out, cursor:done?null:cursor, done, strategy};
     }
 
     async function getRecord(id){ const s=await api.getDoc(docReg(id)); return s.exists()?s.data():null; }
+    async function getMeta(){ const s=await api.getDoc(api.doc(db,'ilikia_meta','info')); return s.exists()?s.data():null; }
 
+    // Historico de um registro. Consulta so por igualdade (indice de campo unico, automatico)
+    // e ordena no cliente por criado_em desc, para dispensar o indice composto (registro_id, criado_em).
+    // O historico por registro e pequeno (poucas entradas), entao a ordenacao no cliente e barata.
+    function tsMillis(v){ if(v==null) return 0; if(typeof v==='number') return v; if(v.toMillis) return v.toMillis(); if(v.seconds!=null) return v.seconds*1000+(v.nanoseconds?v.nanoseconds/1e6:0); const n=Date.parse(v); return isFinite(n)?n:0; }
     async function historico(id){
-      const snap=await api.getDocs(api.query(api.collection(db,HIST),api.where('registro_id','==',id),api.orderBy('criado_em','desc')));
-      return snap.docs.map(d=>d.data());
+      const snap=await api.getDocs(api.query(api.collection(db,HIST),api.where('registro_id','==',id)));
+      return snap.docs.map(d=>d.data()).sort((a,b)=>tsMillis(b.criado_em)-tsMillis(a.criado_em));
     }
 
     /* Gravacao com merge campo a campo dentro de uma transacao.
@@ -138,10 +166,10 @@
     function subscribeQuery(p,cb){
       const {cs,tokens}=buildConstraints(p);
       const q=api.query(colReg(),...cs,api.limit(p.pageSize||50));
-      return api.onSnapshot(q, snap=>cb(snap.docs.map(d=>d.data()).filter(r=>matchAllTokens(r,tokens))));
+      return api.onSnapshot(q, snap=>cb(snap.docs.map(d=>d.data()).filter(r=>matchRow(r,p,tokens))));
     }
 
-    return {queryPage, getRecord, historico, saveCampos, subscribeRecord, subscribeQuery, _sameVal:sameVal, _label:label};
+    return {queryPage, getRecord, getMeta, historico, saveCampos, subscribeRecord, subscribeQuery, _sameVal:sameVal, _label:label};
   }
   const exported={create, label, sameVal};
   if(typeof module!=='undefined'&&module.exports) module.exports=exported;

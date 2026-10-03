@@ -9,7 +9,7 @@
   const UFS=["AC","AL","AM","AP","BA","CE","DF","ES","GO","MA","MG","MS","MT","PA","PB","PE","PI","PR","RJ","RN","RO","RR","RS","SC","SE","SP","TO"];
   const REGIOES=["Centro-Oeste","Nordeste","Norte","Sudeste","Sul"];
   const CLASSIF=["Capital","Interior"];
-  const DATASETS=[["","Todas as modalidades"],["RODOVIARIO","Rodoviario Fracionado"],["AEREO_CONVENCIONAL","Aereo Convencional"],["AEREO_EXPRESSO","Aereo Expresso"],["CIDADES","Cidades Atendidas / Cobertura"],["PRAZOS","Prazos (Redespacho)"]];
+  const DATASETS=[["","Todas as modalidades"],["RODOVIARIO","Rodoviario Fracionado"],["AEREO_CONVENCIONAL","Aereo Convencional"],["AEREO_EXPRESSO","Aereo Expresso"],["CIDADES","Cidades Atendidas"],["PRAZOS","Prazos (Redespacho)"]];
   const GRUPOS_EXPRESSO=[
     {regiao:"SUL",ufs:["PR","SC","RS"]},{regiao:"SUDESTE",ufs:["SP","RJ","MG","ES"]},
     {regiao:"CENTRO-OESTE",ufs:["DF","GO","MS","MT"]},{regiao:"NORTE",ufs:["AC","AM","AP","PA","RO","RR","TO"]},
@@ -32,7 +32,7 @@
     filters:{dataset:"",uf:"",regiao:"",classificacao:"",busca:""},
     rows:[], cursor:null, done:true, paginated:false, pendingRefresh:false,
     unsubList:null, unsubRec:null,
-    selected:null, mode:"consulta", edit:null, tab:"ficha", expCol:null,
+    selected:null, mode:"consulta", edit:null, tab:"ficha", expCol:null, meta:null,
 
     async open(){
       injectCSS();
@@ -41,11 +41,20 @@
       try{ this.cloud=await window.getEfaCloud(); this.user=this.cloud.currentUserEmail&&this.cloud.currentUserEmail(); }
       catch(e){ this.toast("Falha ao conectar: "+(e.message||e),"err"); }
       this.$(".tbx-user").textContent=this.user||"";
-      // marcas oficiais reaproveitadas da pagina
-      const efa=document.getElementById("homeEfa"), cvs=document.getElementById("homeCvs");
-      if(efa&&efa.src)this.$(".tbx-logo-efa").src=efa.src;
-      if(cvs&&cvs.src)this.$(".tbx-logo-cvs").src=cvs.src;
+      const impBtn=this.$(".tbx-imp-btn");
+      if(impBtn) impBtn.style.display=(this.cloud&&this.cloud.isAdmin&&this.cloud.isAdmin()&&this.cloud.importer)?"inline-flex":"none";
+      this.setLogos();
+      if(this.cloud){ try{ this.meta=await this.cloud.tabelas.getMeta(); }catch(e){ this.meta=null; } }
       this.applyFilters();
+    },
+    setLogos(){
+      // marcas oficiais da Area Comercial (as mesmas das Propostas), via EFA_ASSETS; fallback nos imgs da pagina
+      const A=window.EFA_ASSETS||{};
+      const efaSrc=A.logo_efa || ((document.getElementById("homeEfa")||{}).src) || "";
+      const cvsSrc=A.logo_cvs || ((document.getElementById("homeCvs")||{}).src) || "";
+      const e=this.$(".tbx-logo-efa"), c=this.$(".tbx-logo-cvs");
+      if(efaSrc){ e.src=efaSrc; e.style.display=""; } else { e.style.display="none"; }
+      if(cvsSrc){ c.src=cvsSrc; c.style.display=""; } else { c.style.display="none"; }
     },
     close(){ if(this.unsubList)this.unsubList(); if(this.unsubRec)this.unsubRec(); this.unsubList=this.unsubRec=null; this.host.style.display="none"; },
     $(sel){ return this.host.querySelector(sel); },
@@ -67,10 +76,12 @@
       this.$(".tbx-tab-hist").onclick=()=>{ this.tab="hist"; this.renderPanel(); };
       this.$(".tbx-refresh").onclick=()=>{ this.pendingRefresh=false; this.applyFilters(); };
       window.addEventListener("beforeunload",e=>{ if(this.edit&&this.edit.dirty){ e.preventDefault(); e.returnValue=""; } });
+      this.wireImport();
     },
     readFilters(){ this.filters={ dataset:this.$(".tbx-f-mod").value, uf:this.$(".tbx-f-uf").value, regiao:this.$(".tbx-f-reg").value, classificacao:this.$(".tbx-f-cls").value, busca:this.$(".tbx-f-busca").value }; },
 
     isExpresso(){ return this.filters.dataset==="AEREO_EXPRESSO"; },
+    isMapMode(){ const f=this.filters; return !f.dataset && !f.busca && !f.uf && !f.regiao && !f.classificacao; },
     queryParams(){
       const f=this.filters;
       if(this.isExpresso()) return {dataset:"AEREO_EXPRESSO", pageSize:70};
@@ -83,6 +94,8 @@
       this.$(".tbx-refresh").style.display="none";
       // (re)assina realtime da pagina 1
       if(this.unsubList){ this.unsubList(); this.unsubList=null; }
+      if(this.isMapMode()){ this.render(); return; }   // mapa: visao inicial, nao consulta lista
+      this.renderLoading();
       const params=this.queryParams();
       try{
         const p=await this.cloud.tabelas.queryPage(params);
@@ -103,13 +116,71 @@
       catch(e){ this.toast("Falha ao carregar mais: "+(e.message||e),"err"); }
     },
 
-    render(){ if(this.isExpresso()) this.renderMatrix(); else this.renderList(); this.renderPanel(); },
+    render(){ if(this.isMapMode()) this.renderMap(); else if(this.isExpresso()) this.renderMatrix(); else this.renderList(); this.renderPanel(); },
+    renderLoading(){ this.$(".tbx-content").innerHTML='<div class="tbx-loading"><span class="tbx-spin"></span> Carregando...</div>'; },
 
+    // ---------- Mapa (Todas as modalidades) ----------
+    MAP_RAMP:["#DCE9F7","#A9C8E8","#6BA0D6","#2E6DB4","#123A75"],
+    MAP_THR:[50,150,300,500],
+    mapBucket(n){ if(n==null) return -1; let i=0; while(i<this.MAP_THR.length && n>this.MAP_THR[i]) i++; return i; },
+    renderMap(){
+      const body=this.$(".tbx-content");
+      const geo=window.BR_UF_GEO, mapa=this.meta&&this.meta.mapa;
+      if(!geo || !mapa || !mapa.por_uf){
+        body.innerHTML='<div class="tbx-empty"><b>Mapa indisponivel</b><div class="tbx-hint">'+(!geo?'Geometria (br-ufs.js) nao carregada.':'Agregado do mapa ainda nao importado no Firestore (ilikia_meta/info).')+'</div></div>';
+        this.updateCount(0); return;
+      }
+      const counts=mapa.por_uf, RAMP=this.MAP_RAMP;
+      let paths="";
+      for(const uf in geo.ufs){ const u=geo.ufs[uf]; const n=(uf in counts)?counts[uf]:null; const b=this.mapBucket(n); const fill=b<0?"#E2E7EE":RAMP[b];
+        paths+='<path class="tbx-uf" data-uf="'+uf+'" d="'+u.d+'" fill="'+fill+'"></path>'; }
+      let labs="";
+      for(const uf in geo.ufs){ const u=geo.ufs[uf]; const b=this.mapBucket((uf in counts)?counts[uf]:null); labs+='<text class="tbx-uflab" x="'+u.cx+'" y="'+u.cy+'" text-anchor="middle" fill="'+(b>=3?'#fff':'#13181F')+'">'+uf+'</text>'; }
+      const legLabels=["1 a 50","51 a 150","151 a 300","301 a 500","mais de 500"];
+      const legend=legLabels.map((l,i)=>'<span class="tbx-lgi"><i style="background:'+RAMP[i]+'"></i>'+l+'</span>').join('')+'<span class="tbx-lgi"><i style="background:#E2E7EE"></i>sem informacao</span>';
+      body.innerHTML=
+        '<div class="tbx-mapwrap">'+
+          '<div class="tbx-maptop"><div><div class="tbx-maptitle">'+escapeHtml(mapa.metrica_label||"Localidades cadastradas")+' por UF</div>'+
+          '<div class="tbx-mapnote">Fonte: aba Cidades Atendidas. Clique num estado para ver as localidades. Todas estao como Sob Cotacao: cobertura listada, nao atendimento irrestrito.</div></div></div>'+
+          '<div class="tbx-mapgrid"><div class="tbx-mapsvg"><svg viewBox="'+geo.viewBox+'" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Mapa do Brasil por UF">'+paths+labs+'</svg>'+
+          '<div class="tbx-maptip" id="tbxMaptip"></div></div>'+
+          '<div class="tbx-mapside"><div class="tbx-lg">'+legend+'</div><div class="tbx-maplimit">Metrica provisoria: '+escapeHtml(mapa.metrica_nota||"")+'</div></div></div>'+
+          '<div class="tbx-mapsrc">Limites: '+escapeHtml((geo.fonte||"IBGE"))+'</div>'+
+        '</div>';
+      // interacoes
+      const tip=body.querySelector("#tbxMaptip");
+      body.querySelectorAll("path.tbx-uf").forEach(p=>{
+        const uf=p.getAttribute("data-uf"); const u=geo.ufs[uf]; const n=(uf in counts)?counts[uf]:null;
+        const show=(ev)=>{ tip.innerHTML='<b>'+escapeHtml(u.nome)+' ('+uf+')</b><br>'+(n==null?'sem informacao':(n+' localidade'+(n!==1?'s':'')+' cadastrada'+(n!==1?'s':'')));
+          tip.style.display="block"; const wrap=body.querySelector(".tbx-mapsvg").getBoundingClientRect();
+          const cx=ev&&ev.clientX!=null?ev.clientX:wrap.left+wrap.width/2, cy=ev&&ev.clientY!=null?ev.clientY:wrap.top;
+          let x=cx-wrap.left+12, y=cy-wrap.top+12; if(x>wrap.width-150)x=wrap.width-150; tip.style.left=x+"px"; tip.style.top=y+"px"; };
+        p.addEventListener("mouseenter",show); p.addEventListener("mousemove",show);
+        p.addEventListener("mouseleave",()=>{ tip.style.display="none"; });
+        p.addEventListener("click",()=>this.drillUF(uf));
+      });
+      this.$(".tbx-count").innerHTML="<b>"+(mapa.total_localidades!=null?mapa.total_localidades:"")+"</b> localidades cadastradas em <b>27</b> UFs";
+    },
+    drillUF(uf){
+      this.filters={dataset:"CIDADES",uf:uf,regiao:"",classificacao:"",busca:""};
+      this.$(".tbx-f-mod").value="CIDADES"; this.$(".tbx-f-uf").value=uf; this.$(".tbx-f-reg").value=""; this.$(".tbx-f-cls").value=""; this.$(".tbx-f-busca").value="";
+      this.applyFilters();
+    },
+
+    DLABEL:{CIDADES:"Cidades Atendidas",AEREO_EXPRESSO:"Aéreo Expresso",AEREO_CONVENCIONAL:"Aéreo Convencional",RODOVIARIO:"Rodoviário Fracionado",PRAZOS:"Prazos (Redespacho)"},
+    dLabel(r){ return this.DLABEL[r.dataset] || r.modalidade; },
+    col5(){
+      const ds=this.filters.dataset;
+      if(ds==="AEREO_CONVENCIONAL") return {header:"Prazos", get:r=>r.campos.find(x=>x.key==="prazo")};
+      if(ds==="CIDADES"||ds==="PRAZOS") return {header:"Sob cotação", get:r=>r.campos.find(x=>x.key==="tipo_class")};
+      if(ds==="RODOVIARIO") return {header:"Classif.", get:r=>r.classificacao};
+      return {header:"Situação", get:r=> r.classificacao || r.campos.find(x=>x.key==="prazo") || r.campos.find(x=>x.key==="tipo_class") };
+    },
     renderList(){
       const body=this.$(".tbx-content");
-      const f=this.filters;
+      const c5=this.col5();
       let html='<div class="tbx-tablewrap"><table class="tbx-table"><thead><tr>'+
-        '<th>Localidade</th><th>UF</th><th>Sigla</th><th>Regiao</th><th>Classif.</th><th>Modalidade</th><th>Valor de referencia</th></tr></thead><tbody></tbody></table></div>';
+        '<th>Localidade</th><th>UF</th><th>Sigla</th><th>Regiao</th><th>'+escapeHtml(c5.header)+'</th><th>Modalidade</th><th>Valor de referencia</th></tr></thead><tbody></tbody></table></div>';
       body.innerHTML=html;
       const tb=body.querySelector("tbody");
       if(!this.rows.length){ body.innerHTML='<div class="tbx-empty"><b>Nenhum registro encontrado</b><div>Ajuste a busca ou os filtros. A busca ignora acento e maiuscula.</div></div>'; this.updateCount(0); return; }
@@ -122,8 +193,11 @@
       const tr=el("tr"); if(this.selected&&this.selected.id===r.id)tr.className="tbx-sel";
       const td=(n)=>{const c=el("td"); if(typeof n==="string")c.textContent=n; else if(n==null)c.appendChild(el("span","tbx-muted","-")); else c.appendChild(n); return c;};
       tr.appendChild((()=>{const c=td(el("span","tbx-loc",String(r.localidade)));return c;})());
-      tr.appendChild(td(r.uf||null)); tr.appendChild(td(r.sigla||null)); tr.appendChild(td(r.regiao||null)); tr.appendChild(td(r.classificacao||null));
-      tr.appendChild(td(el("span","tbx-ds tbx-ds-"+r.dataset,r.modalidade)));
+      tr.appendChild(td(r.uf||null)); tr.appendChild(td(r.sigla||null)); tr.appendChild(td(r.regiao||null));
+      const c5=this.col5(), v5=c5.get(r); let cell5=null;
+      if(v5!=null && v5!==""){ if(typeof v5==="string") cell5=v5; else { const w=el("span"); w.appendChild(valNode(v5)); if(v5.unit&&/int|number|money/.test(v5.kind)){ w.appendChild(el("span","tbx-un"," "+v5.unit)); } cell5=w; } }
+      tr.appendChild(td(cell5));
+      tr.appendChild(td(el("span","tbx-ds tbx-ds-"+r.dataset,this.dLabel(r))));
       const ref=r.campos.find(c=>c.kind==="money")||r.campos.find(c=>c.kind==="cotacao")||r.campos[0];
       tr.appendChild(td(ref?valNode(ref):null));
       tr.onclick=()=>this.openRecord(r.id);
@@ -178,7 +252,7 @@
     renderPanel(){
       const r=this.selected; const p=this.$(".tbx-panel"); if(!r){ return; }
       this.$(".tbx-pt").textContent=String(r.localidade);
-      this.$(".tbx-ps").textContent=r.modalidade+"  |  origem "+r.origem+(r.classificacao?("  |  "+r.classificacao):"");
+      this.$(".tbx-ps").textContent=this.dLabel(r)+"  |  origem "+r.origem+(r.classificacao?("  |  "+r.classificacao):"");
       this.$(".tbx-tab-ficha").classList.toggle("on",this.tab==="ficha");
       this.$(".tbx-tab-hist").classList.toggle("on",this.tab==="hist");
       const body=this.$(".tbx-pbody"), foot=this.$(".tbx-pfoot"); body.innerHTML=""; foot.innerHTML="";
@@ -323,6 +397,113 @@
       catch(e){ if(e&&e.code==="conflict"){ this.toast("O registro mudou. Abra de novo e tente.","warn"); } else this.toast("Falha: "+(e.message||e),"err"); }
     },
 
+    // ---------- Importacao administrativa (admin) ----------
+    wireImport(){
+      const ov=this.$(".tbx-imp"), file=this.$(".tbx-imp-file"), btn=this.$(".tbx-imp-btn");
+      if(btn) btn.onclick=()=>this.openImport();
+      if(this.$(".tbx-imp-x")) this.$(".tbx-imp-x").onclick=()=>this.closeImport();
+      if(ov) ov.addEventListener("click",e=>{ if(e.target===ov) this.closeImport(); });
+      if(file) file.addEventListener("change",()=>{ const f=file.files&&file.files[0]; if(f) this.onImpFile(f); });
+    },
+    impAllowed(){ return !!(this.cloud&&this.cloud.isAdmin&&this.cloud.isAdmin()&&this.cloud.importer); },
+    openImport(){
+      if(!this.impAllowed()){ this.toast("Importacao restrita ao administrador.","err"); return; }
+      this.imp={json:null,validation:null,report:null,running:false};
+      const ov=this.$(".tbx-imp"); ov.classList.add("on"); ov.setAttribute("aria-hidden","false");
+      this.renderImpPick();
+    },
+    closeImport(){
+      if(this.imp&&this.imp.running){ if(!confirm("A importacao esta em andamento. Fechar nao desfaz o que ja foi gravado, mas voce perde o acompanhamento. Fechar mesmo assim?")) return; }
+      const ov=this.$(".tbx-imp"); ov.classList.remove("on"); ov.setAttribute("aria-hidden","true");
+      const file=this.$(".tbx-imp-file"); if(file) file.value="";
+      if(this.imp&&this.imp.report&&(this.imp.report.created>0||this.imp.report.metaWritten)) this.refreshAfterImport();
+    },
+    renderImpPick(){
+      const b=this.$(".tbx-imp-body"), f=this.$(".tbx-imp-foot"); f.innerHTML="";
+      const proj=(window.EFA_FIREBASE_CONFIG&&window.EFA_FIREBASE_CONFIG.projectId)||"desconhecido";
+      b.innerHTML='<p class="tbx-imp-p">Selecione o arquivo <b>ilikia_seed.json</b> no seu computador. Ele fica apenas no seu navegador: nada e enviado antes de voce validar e confirmar.</p>'+
+        '<div class="tbx-imp-proj '+(proj==="efa-comercial"?"ok":"bad")+'">Projeto conectado: <b>'+escapeHtml(proj)+'</b></div>';
+      const pick=el("button","tbx-b-save","Selecionar arquivo JSON"); pick.onclick=()=>this.$(".tbx-imp-file").click(); f.appendChild(pick);
+      const cancel=el("button","tbx-b-cancel","Fechar"); cancel.onclick=()=>this.closeImport(); f.appendChild(cancel);
+    },
+    async onImpFile(file){
+      const b=this.$(".tbx-imp-body"); b.innerHTML='<div class="tbx-loading"><span class="tbx-spin"></span> Lendo e validando...</div>'; this.$(".tbx-imp-foot").innerHTML="";
+      let text; try{ text=await file.text(); }catch(e){ this.renderImpError("Nao consegui ler o arquivo: "+(e.message||e)); return; }
+      let json; try{ json=JSON.parse(text); }catch(e){ this.renderImpError("O arquivo nao e um JSON valido: "+(e.message||e)); return; }
+      let rep; try{ rep=this.cloud.importer.validate(json); }catch(e){ this.renderImpError("Falha na validacao: "+(e.message||e)); return; }
+      this.imp.json=json; this.imp.validation=rep;
+      this.renderImpValidation(rep,file.name);
+    },
+    renderImpValidation(rep,name){
+      const b=this.$(".tbx-imp-body"), f=this.$(".tbx-imp-foot"); f.innerHTML="";
+      let rows=Object.keys(rep.counts).map(k=>'<tr><td>'+escapeHtml(this.DLABEL[k]||k)+'</td><td class="tbx-num">'+rep.counts[k]+'</td></tr>').join('');
+      if(rep.outros) rows+='<tr><td>outras modalidades</td><td class="tbx-num">'+rep.outros+'</td></tr>';
+      const projOk=rep.matchesTarget;
+      let html='<div class="tbx-imp-proj '+(projOk?"ok":"bad")+'">Projeto conectado: <b>'+escapeHtml(rep.projectId||"desconhecido")+'</b> '+(projOk?"(confere com efa-comercial)":"(NAO e efa-comercial: a importacao fica bloqueada)")+'</div>'+
+        '<div class="tbx-imp-fn">Arquivo: '+escapeHtml(name||"")+'</div>'+
+        '<table class="tbx-imp-tab"><thead><tr><th>Modalidade</th><th class="tbx-num">Registros</th></tr></thead><tbody>'+rows+
+          '<tr class="tbx-imp-tot"><td>Total</td><td class="tbx-num">'+rep.total+'</td></tr></tbody></table>'+
+        '<div class="tbx-imp-meta">Metadata (mapa): '+(rep.metaPresent?("presente"+(rep.metaMapUfs?(" - "+rep.metaMapUfs+" UFs"):" (sem mapa.por_uf)")):"ausente")+'</div>';
+      if(rep.problems&&rep.problems.length) html+='<div class="tbx-imp-box bad"><b>Impedimentos (corrija antes de importar):</b><ul>'+rep.problems.map(p=>"<li>"+escapeHtml(p)+"</li>").join("")+'</ul></div>';
+      if(rep.warnings&&rep.warnings.length) html+='<div class="tbx-imp-box warn"><b>Observacoes:</b><ul>'+rep.warnings.map(p=>"<li>"+escapeHtml(p)+"</li>").join("")+'</ul></div>';
+      html+='<div class="tbx-imp-note">A importacao <b>nao sobrescreve</b> registros ja existentes online (edicoes da equipe sao preservadas). Pode rodar de novo: cria so o que falta, sem duplicar.</div>';
+      b.innerHTML=html;
+      const canRun=rep.ok&&rep.matchesTarget;
+      const other=el("button","tbx-b-cancel","Escolher outro arquivo"); other.onclick=()=>this.renderImpPick(); f.appendChild(other);
+      const go=el("button","tbx-b-save",canRun?"Importar agora":"Importacao bloqueada"); go.disabled=!canRun; if(canRun) go.onclick=()=>this.runImport(); f.appendChild(go);
+      this.maybeShowResume();
+    },
+    async maybeShowResume(){
+      try{ const p=await this.cloud.importer.getProgress();
+        if(p&&!p.done&&this.imp&&this.imp.validation&&p.total===this.imp.validation.total&&p.sig===this.imp.validation.sig){
+          const n=el("div","tbx-imp-box warn"); n.innerHTML="<b>Retomada:</b> a importacao anterior deste arquivo ficou com pendencias. Importar de novo reavalia o que ja existe online e recria so o que falta, sem duplicar nem sobrescrever.";
+          const b=this.$(".tbx-imp-body"); if(b) b.appendChild(n); }
+      }catch(e){}
+    },
+    async runImport(){
+      if(!this.imp||!this.imp.json) return;
+      this.imp.running=true; this.$(".tbx-imp-foot").innerHTML="";
+      this.renderImpProgress({index:0,total:(this.imp.validation&&this.imp.validation.total)||0,created:0,preserved:0,failed:0,phase:"start"});
+      let report;
+      try{ report=await this.cloud.importer.run(this.imp.json,(st)=>this.renderImpProgress(st)); }
+      catch(e){ this.imp.running=false; this.renderImpError("A importacao parou: "+(e.message||e)+(e.problems?(" ("+e.problems.join("; ")+")"):"")); return; }
+      this.imp.running=false; this.imp.report=report; this.renderImpResult(report);
+    },
+    renderImpProgress(st){
+      const b=this.$(".tbx-imp-body"); if(!b) return;
+      if(st.phase==="scan"){
+        b.innerHTML='<div class="tbx-imp-run"><div class="tbx-imp-bar tbx-imp-indet"><i></i></div>'+
+          '<div class="tbx-imp-stat">Verificando registros existentes'+(st.scanned?(" ("+st.scanned+")"):"")+'...</div>'+
+          '<div class="tbx-imp-note">Conferindo o que ja existe online para criar so o que falta e preservar o resto.</div></div>';
+        return;
+      }
+      const total=st.total||1, done=st.index||0, pct=Math.min(100,Math.round(done/total*100));
+      b.innerHTML='<div class="tbx-imp-run"><div class="tbx-imp-bar"><i style="width:'+pct+'%"></i></div>'+
+        '<div class="tbx-imp-stat">'+done+' de '+total+' processados ('+pct+'%)</div>'+
+        '<div class="tbx-imp-nums">Criados: <b>'+(st.created||0)+'</b> &middot; Preservados: <b>'+(st.preserved||0)+'</b> &middot; Falhas: <b>'+(st.failed||0)+'</b></div>'+
+        '<div class="tbx-imp-note">Se fechar ou a conexao cair, rode de novo: ele reavalia o que ja existe e recria so o que falta.</div></div>';
+    },
+    renderImpResult(report){
+      const b=this.$(".tbx-imp-body"), f=this.$(".tbx-imp-foot"); f.innerHTML="";
+      let html='<div class="tbx-imp-box '+(report.failed?"warn":"ok")+'"><b>'+(report.failed?"Importacao concluida com pendencias":"Importacao concluida")+'</b></div>'+
+        '<div class="tbx-imp-nums">Criados: <b>'+report.created+'</b><br>Preservados (ja existiam online, nao sobrescritos): <b>'+report.preserved+'</b><br>Falhas: <b>'+report.failed+'</b><br>Mapa (ilikia_meta/info): <b>'+(report.metaWritten?"gravado":(report.metaPreserved?"ja existia, preservado":(report.metaFailed?"falhou (use Tentar de novo)":"nao enviado")))+'</b></div>';
+      if(report.failures&&report.failures.length) html+='<div class="tbx-imp-box warn"><b>Falhas (ate 50 listadas):</b><ul>'+report.failures.slice(0,50).map(x=>"<li>"+escapeHtml(x.id)+": "+escapeHtml(x.erro)+"</li>").join("")+'</ul><div>Rode de novo para tentar os que faltaram; nada ja gravado e duplicado.</div></div>';
+      html+='<div class="tbx-imp-note">Feche para ver os dados na tela; a consulta ja reflete o que foi gravado.</div>';
+      b.innerHTML=html;
+      const close=el("button","tbx-b-save","Concluir e ver os dados"); close.onclick=()=>this.closeImport(); f.appendChild(close);
+      if(report.failed){ const retry=el("button","tbx-b-cancel","Tentar os que faltaram"); retry.onclick=()=>this.runImport(); f.appendChild(retry); }
+    },
+    renderImpError(msg){
+      const b=this.$(".tbx-imp-body"), f=this.$(".tbx-imp-foot"); f.innerHTML="";
+      b.innerHTML='<div class="tbx-imp-box bad"><b>Nao deu para seguir</b><div>'+escapeHtml(msg)+'</div></div>';
+      const other=el("button","tbx-b-save","Escolher arquivo"); other.onclick=()=>this.renderImpPick(); f.appendChild(other);
+      const cancel=el("button","tbx-b-cancel","Fechar"); cancel.onclick=()=>this.closeImport(); f.appendChild(cancel);
+    },
+    async refreshAfterImport(){
+      try{ if(this.cloud) this.meta=await this.cloud.tabelas.getMeta(); }catch(e){}
+      this.applyFilters();
+    },
+
     toast(msg,kind){ let t=this.$(".tbx-toast"); t.textContent=msg; t.className="tbx-toast on "+(kind||""); clearTimeout(this._tt); this._tt=setTimeout(()=>t.className="tbx-toast "+(kind||""),3400); }
   };
   function parseVal(txt,c){ if(txt==="(em branco)")return {value:null,kind:"blank"}; if(txt==="0")return {value:0,kind:(/^prazo/.test(c.key)?"int":"zero")}; if(norm(txt)==="sob cotacao")return {value:txt,kind:"cotacao"};
@@ -347,6 +528,7 @@
       <div class="tbx-fld"><label>Classificacao</label><select class="tbx-f-cls"></select></div>
       <div class="tbx-fld tbx-busca"><label>Buscar localidade / cidade</label><input class="tbx-f-busca" type="search" placeholder="Ex.: Porto Alegre" autocomplete="off"></div>
       <button class="tbx-refresh" style="display:none">Ha atualizacoes, recarregar</button>
+      <button class="tbx-imp-btn" style="display:none" title="Importar a base ILIKIA (restrito ao administrador)">Importar base</button>
       <div class="tbx-count"></div>
     </div>
     <div class="tbx-content"></div>
@@ -358,7 +540,15 @@
     <div class="tbx-pbody"></div>
     <div class="tbx-pfoot"></div>
   </aside>
-  <div class="tbx-toast"></div>`;
+  <div class="tbx-toast"></div>
+  <div class="tbx-imp" aria-hidden="true">
+    <div class="tbx-imp-card">
+      <div class="tbx-imp-hd"><b>Importar base ILIKIA</b><button class="tbx-imp-x" title="Fechar">&times;</button></div>
+      <div class="tbx-imp-body"></div>
+      <div class="tbx-imp-foot"></div>
+    </div>
+    <input class="tbx-imp-file" type="file" accept=".json,application/json" style="display:none">
+  </div>`;
 
   const STYLE=`
   #tabelasView{position:fixed;inset:0;z-index:180;display:none;background:#F2F5F9;color:#13181F;font-size:14px;overflow:hidden;
@@ -432,7 +622,50 @@
   .tbx-mini{margin-top:5px;background:#F6F8FB;border:1px solid #E2E7EE;border-radius:7px;padding:4px 9px;font-weight:800;font-size:11px;color:#1F6FCC;cursor:pointer}
   .tbx-toast{position:absolute;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);z-index:9;background:#13181F;color:#fff;padding:11px 16px;border-radius:10px;font-size:13px;font-weight:700;box-shadow:0 10px 34px rgba(16,28,48,.3);opacity:0;pointer-events:none;transition:.2s;max-width:92vw}
   .tbx-toast.on{opacity:1;transform:translateX(-50%)} .tbx-toast.ok{background:#16794A} .tbx-toast.err{background:#B4232A} .tbx-toast.warn{background:#8A5A00}
+  /* estados e mapa */
+  .tbx-loading{display:flex;align-items:center;gap:10px;justify-content:center;padding:48px 20px;color:#55606D;font-weight:700}
+  .tbx-spin{width:18px;height:18px;border:2px solid #CcD6E4;border-top-color:#123A75;border-radius:50%;display:inline-block;animation:tbxspin .7s linear infinite}
+  @keyframes tbxspin{to{transform:rotate(360deg)}}
+  .tbx-mapwrap{background:#fff;border:1px solid #E2E7EE;border-radius:12px;padding:16px;box-shadow:0 1px 2px rgba(16,28,48,.06)}
+  .tbx-maptop{margin-bottom:10px} .tbx-maptitle{font-size:15px;font-weight:800;color:#123A75} .tbx-mapnote{font-size:12px;color:#55606D;margin-top:3px;max-width:640px}
+  .tbx-mapgrid{display:grid;grid-template-columns:minmax(0,1fr) 230px;gap:18px;align-items:start}
+  .tbx-mapsvg{position:relative;min-width:0} .tbx-mapsvg svg{width:100%;height:auto;display:block;max-height:68vh}
+  .tbx-uf{stroke:#fff;stroke-width:1;cursor:pointer;transition:opacity .1s} .tbx-uf:hover{opacity:.82;stroke:#123A75;stroke-width:1.4}
+  .tbx-uflab{font:700 11px -apple-system,system-ui,sans-serif;pointer-events:none}
+  .tbx-maptip{position:absolute;display:none;background:#13181F;color:#fff;font-size:12px;padding:7px 10px;border-radius:8px;pointer-events:none;z-index:4;box-shadow:0 6px 20px rgba(16,28,48,.3);white-space:nowrap}
+  .tbx-mapside{display:flex;flex-direction:column;gap:12px}
+  .tbx-lg{display:flex;flex-direction:column;gap:7px;font-size:12px;color:#55606D} .tbx-lgi{display:flex;align-items:center} .tbx-lgi i{display:inline-block;width:16px;height:12px;border-radius:3px;margin-right:7px}
+  .tbx-maplimit{font-size:11px;color:#8A94A2;line-height:1.5;border-top:1px solid #E2E7EE;padding-top:10px}
+  .tbx-mapsrc{font-size:10.5px;color:#8A94A2;margin-top:10px;text-align:right}
   @media (max-width:640px){ .tbx-panel{width:100%} .tbx-fld{min-width:calc(50% - 5px)} .tbx-busca{min-width:100%} .tbx-count{margin-left:0;width:100%}
-    .tbx-table th:nth-child(3),.tbx-table td:nth-child(3),.tbx-table th:nth-child(4),.tbx-table td:nth-child(4){display:none} .tbx-user{display:none} }
+    .tbx-table th:nth-child(3),.tbx-table td:nth-child(3),.tbx-table th:nth-child(4),.tbx-table td:nth-child(4){display:none} .tbx-user{display:none}
+    .tbx-mapgrid{grid-template-columns:1fr} .tbx-lg{flex-direction:row;flex-wrap:wrap;gap:10px} }
+  /* importacao (admin) */
+  .tbx-imp-btn{background:#123A75;border:1px solid #123A75;color:#fff;font-weight:800;font-size:12.5px;padding:7px 12px;border-radius:8px;cursor:pointer}
+  .tbx-imp-btn:hover{background:#0E2E5E}
+  .tbx-imp{position:absolute;inset:0;z-index:20;display:none;align-items:center;justify-content:center;background:rgba(16,28,48,.5);padding:18px}
+  .tbx-imp.on{display:flex}
+  .tbx-imp-card{background:#fff;border-radius:14px;width:560px;max-width:100%;max-height:88vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 24px 70px rgba(16,28,48,.4)}
+  .tbx-imp-hd{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid #E2E7EE;font-size:15px;color:#123A75}
+  .tbx-imp-x{background:none;border:0;font-size:22px;line-height:1;color:#8A94A2;cursor:pointer}
+  .tbx-imp-body{padding:16px 18px;overflow:auto}
+  .tbx-imp-foot{padding:12px 18px;border-top:1px solid #E2E7EE;display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}
+  .tbx-imp-p{margin:0 0 12px;color:#55606D;line-height:1.5}
+  .tbx-imp-proj{font-size:12.5px;padding:8px 10px;border-radius:8px;margin-bottom:10px;background:#F6F8FB;border:1px solid #E2E7EE}
+  .tbx-imp-proj.ok{background:#EAF6EF;border-color:#BFE3CE;color:#16794A} .tbx-imp-proj.bad{background:#FBEBEC;border-color:#F0C4C7;color:#B4232A}
+  .tbx-imp-fn{font-size:12px;color:#8A94A2;margin-bottom:8px}
+  .tbx-imp-tab{width:100%;border-collapse:collapse;font-size:13px;margin-bottom:10px}
+  .tbx-imp-tab th,.tbx-imp-tab td{border-bottom:1px solid #EEF1F6;padding:6px 8px;text-align:left} .tbx-imp-tab .tbx-num{text-align:right;font-variant-numeric:tabular-nums}
+  .tbx-imp-tab thead th{color:#55606D;font-size:11px;text-transform:uppercase;letter-spacing:.03em}
+  .tbx-imp-tot td{font-weight:800;color:#123A75;border-top:2px solid #E2E7EE}
+  .tbx-imp-meta{font-size:12.5px;color:#55606D;margin-bottom:10px}
+  .tbx-imp-box{border-radius:9px;padding:10px 12px;margin:10px 0;font-size:12.5px;line-height:1.5} .tbx-imp-box ul{margin:6px 0 0;padding-left:18px}
+  .tbx-imp-box.ok{background:#EAF6EF;border:1px solid #BFE3CE;color:#16794A} .tbx-imp-box.warn{background:#FDF3E2;border:1px solid #EAD9A8;color:#8A5A00} .tbx-imp-box.bad{background:#FBEBEC;border:1px solid #F0C4C7;color:#B4232A}
+  .tbx-imp-note{font-size:11.5px;color:#8A94A2;line-height:1.5;margin-top:8px}
+  .tbx-imp-run{padding:8px 0}
+  .tbx-imp-bar{height:12px;background:#EEF1F6;border-radius:7px;overflow:hidden;margin-bottom:10px} .tbx-imp-bar i{display:block;height:100%;background:#2E6DB4;transition:width .2s}
+  .tbx-imp-indet i{width:40%;animation:tbxindet 1.1s ease-in-out infinite} @keyframes tbxindet{0%{margin-left:-40%}100%{margin-left:100%}}
+  .tbx-imp-stat{font-weight:800;color:#123A75;font-size:14px} .tbx-imp-nums{font-size:12.5px;color:#55606D;margin-top:6px}
+  @media (max-width:640px){ .tbx-imp-card{width:100%} }
   `;
 })();
